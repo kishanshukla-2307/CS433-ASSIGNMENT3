@@ -3,53 +3,81 @@
 #include <assert.h>
 #include <cuda.h>
 #include <sys/time.h>
+#include <curand.h>
+#include <curand_kernel.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
-using namespace std;
+#define MAX_ITR 1000
+#define TOL 1e-5
 
 __managed__ float diff = 0.0;
-__managed__ int itr = 0;
+__managed__ int Itr = 0;
+__managed__ bool done = 0;
 
-__global__ void init (float *A, int span)
+__global__ void init (float *A, int span, int n)
 {
 	int i;
 	int id = threadIdx.x + blockIdx.x * blockDim.x;
-
+	curandState_t state;
+	curand_init(id, 0, 0, &state);
         for (i=span*id; i<span*(id+1); i++) {
-                A[i] = ((float)(random() % 100)/100.0);
+		int r = i/n, c = i%n;
+                A[(r+1)*(n+2)+c+1] = ((float)(curand(&state) % 100)/100.0);
         }
 }
 
 __global__ void solver (float *A, int span, int n)
 {
 	int id = threadIdx.x + blockIdx.x * blockDim.x;
-	int start = id * span, end = start + span - 1;
+	int start = id * span, end = start + span - 1, itr = 0;
 	float local_diff = 0.0, temp;
-	while (!done) {
+
+	while (!done && itr < MAX_ITR) {
+		local_diff = 0.0;
 		for (int idx=start; idx<=end; ++idx) {
 			int i = idx/n, j = idx%n;
-			temp = A[idx];
-			A[idx] = 0.2 * (A[idx] + A[(i-1)*n+j] + A[(i+1)*n+j] + A[i*n+(j-1)] + A[i*n+(j+1)]);
-			local_diff += abs(A[idx] - temp);
+			i++; j++;
+			temp = A[i*(n+2)+j];
+			A[i*(n+2)+j] = 0.2 * (A[i*(n+2)+j] + A[(i-1)*(n+2)+j] + A[(i+1)*(n+2)+j] + A[i*(n+2)+(j-1)] + A[i*(n+2)+(j+1)]);
+//			A[i*(n+2)+j] = 0.2 * (A[i*(n+2)+j]);
+			local_diff += abs(A[i*(n+2)+j] - temp);
 		}
+		atomicAdd(&diff, local_diff);
+//		cg::grid_group grid = cg::this_grid();
+//		grid.sync();
+		__syncthreads();
+		itr++;
+		if (id == 0) {
+			if ((float)diff/(n*n) < TOL) {
+				done = 1;
+			}
+			printf("[itr]: %d, [diff]: %f\n", itr, (float)diff/(n*n));
+			diff = 0.0;
+		}
+		__syncthreads();
+//		grid.sync();
+
+	}
+
+	if (id == 0) {
+		Itr = itr;
 	}
 
 }
 
 int main(int argc, char *argv[]){
-	float *A, *x, *y, *y_cpu;
+	float *A;
 	if (argc != 3) {
 		printf("Need matrix dimension and thread count!\n");
 	}
 	int n = atoi(argv[1]), nthreads = atoi(argv[2]), num_blocks1 = -1, threads_per_block1 = -1, num_blocks2 = -1, threads_per_block2 = -1;
-	struct timeval tv0, tv1, tv2, tv3;
-	struct timezone tz0, tz1, tz2, tz3;
+	struct timeval tv0, tv1, tv2;
+	struct timezone tz0, tz1, tz2;
 	// check nthreads is power of 2
 	assert((nthreads & (nthreads - 1)) == 0);
 
-	cudaMallocManaged((void**)&A, sizeof(float)*n*n);
-	cudaMallocManaged((void**)&x, sizeof(float)*n);	
-	cudaMallocManaged((void**)&y, sizeof(float)*n);
-	y_cpu = (float*)malloc(n*sizeof(float));
+	cudaMallocManaged((void**)&A, sizeof(float)*(n+2)*(n+2));
 
 	if (nthreads < 32) {
 		num_blocks1 = 1;
@@ -70,66 +98,40 @@ int main(int argc, char *argv[]){
 
 	gettimeofday(&tv0, &tz0);
 
-	init<<<num_blocks2, threads_per_block2>>>(A, x, y, (n*n)/nthreads, n/nthreads, n);
+	init<<<num_blocks2, threads_per_block2>>>(A, (n*n)/nthreads, n);
 	cudaDeviceSynchronize();
+
+	int i;
+	for (i=0; i<n+2; ++i) {A[i] = 0;} 		//upper pad
+	for (i=0; i<(n+2)*(n+2); i+=n+2) {A[i] = 0;}	//left pad
+	for (i=n+1; i<(n+2)*(n+2); i+=n+2) {A[i] = 0;}	//right pad
+	for (i=(n+1)*(n+2); i<(n+2)*(n+2); i++) {A[i] = 0;}	//bottom pad
+
+	cudaError_t err = cudaGetLastError();        // Get error code
+
+        if ( err != cudaSuccess ) {
+                printf("CUDA Error [Init]: %s\n", cudaGetErrorString(err));
+                exit(-1);
+        }
+        cudaDeviceSynchronize();
 
 	gettimeofday(&tv1, &tz1);
 
-	multiply<<<num_blocks1, threads_per_block1>>>(A, x, y, (n*n)/nthreads, n);
+	solver<<<1, nthreads>>>(A, (n*n)/nthreads, n);
 	cudaDeviceSynchronize();
 
 	gettimeofday(&tv2, &tz2);
 
-	printf("Init time: %ld microseconds, Multiply time: %ld microseconds\n", (tv1.tv_sec-tv0.tv_sec)*1000000+(tv1.tv_usec-tv0.tv_usec), (tv2.tv_sec-tv1.tv_sec)*1000000+(tv2.tv_usec-tv1.tv_usec));
+	printf("Init time: %ld microseconds, Convergence time: %ld microseconds\n", (tv1.tv_sec-tv0.tv_sec)*1000000+(tv1.tv_usec-tv0.tv_usec), (tv2.tv_sec-tv1.tv_sec)*1000000+(tv2.tv_usec-tv1.tv_usec));
 
-	cudaError_t err = cudaGetLastError();        // Get error code
+	err = cudaGetLastError();        // Get error code
 
 	if ( err != cudaSuccess ) {
-		printf("CUDA Error: %s\n", cudaGetErrorString(err));
+		printf("CUDA Error [Solver]: %s\n", cudaGetErrorString(err));
 		exit(-1);
 	}
 	cudaDeviceSynchronize();
 
-	err = cudaGetLastError();        // Get error code
-
-        if ( err != cudaSuccess ) {
-                printf("CUDA Error: %s\n", cudaGetErrorString(err));
-                exit(-1);
-        }
-
-	for (int i=0; i<n; ++i) {
-		y_cpu[i] = 0;
-	}
-/*
-#pragma omp parallel for num_threads (nthreads)
-	for (int i=0; i<n*n; ++i) {
-		int r = i/n, c = i%n;
-		float temp = A[i] * x[c];
-	#pragma omp critical
-		y_cpu[r] += temp;
-	}
-*/
-
-	for (int i=0; i<n; ++i) {
-		float sum = 0.0;
-		for (int j=0; j<n; ++j) {
-			sum += A[i*n+j] * x[j];
-		}
-		y_cpu[i] = sum;
-	}
-
-	gettimeofday(&tv3, &tz3);
-
-	printf("OpenMP time: %ld microseconds\n", (tv3.tv_sec-tv2.tv_sec)*1000000+(tv3.tv_usec-tv2.tv_usec));
-
-	float diff = 0.0;
-	for (int i=0; i<n; ++i) {
-		diff += abs(y[i] - y_cpu[i]);
-	}
-	printf("Diff sum: %f, y = %f\n",diff, y_cpu[random()%n]);
-//	for (int i=0; i<n; ++i) {
-//		printf("%f, ", y_cpu[i]);
-//	}
-	printf("\n");
+	printf("Diff: %f, Itr: %d\n",diff, Itr);
 	return 0;
 }
